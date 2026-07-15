@@ -1,77 +1,76 @@
-name: Build UniApp Android Plugin AAR
+# 编译 GlobalFloat.aar（含 ScreenshotGuardService）
+# 用法：
+# 1. 确保 nativeplugins/GlobalFloat/android/libs/uniapp-v8-release.aar 已提交到仓库
+# 2. GitHub → Actions → Build GlobalFloat AAR → Run workflow
+# 3. 跑完后在 Artifacts 下载 GlobalFloat.aar
+# 4. 放到本机：nativeplugins/GlobalFloat/android/GlobalFloat.aar
+# 5. HBuilderX 重新打自定义基座
+
+name: Build GlobalFloat AAR
 
 on:
-  workflow_dispatch: # 允许手动点击运行
+  workflow_dispatch:
+  push:
+    paths:
+      - 'nativeplugins/GlobalFloat/**'
+      - '.github/workflows/build-aar.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nativeplugins/GlobalFloat
 
     steps:
-    # 1. 拉取仓库代码
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # 2. 设置 JDK 11 (最契合你本地 SDK 版本的 Java 运行环境)
-    - name: Set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'zulu'
-        java-version: '11'
+      - name: Check uniapp aar exists
+        run: |
+          if [ ! -f android/libs/uniapp-v8-release.aar ]; then
+            echo "::error::缺少 android/libs/uniapp-v8-release.aar"
+            echo "请从 uni-app Android 离线 SDK 复制该文件到 libs/ 并提交到仓库后再跑。"
+            exit 1
+          fi
+          ls -lh android/libs/
 
-    # 3. 配置编译所需的 Gradle 7.5
-    - name: Setup Gradle 7.5
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        gradle-version: '7.5'
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-    # 4. 构建父项目，并把“包含 uniapp-v8-release.aar 的整个子工程”完整且完好地放入其中
-    - name: Construct Root Project Environment
-      run: |
-        # 1. 临时备份现有的安卓项目目录
-        mv android globalfloat
-        
-        # 2. 重新创建一个干净的父项目根目录
-        mkdir android
-        
-        # 3. 将原项目（含已经手动上传的 libs）完整移入其中
-        mv globalfloat android/
-        
-        # 4. 动态写入父项目的 build.gradle (提供 Android 构建基本环境)
-        cat << 'EOF' > android/build.gradle
-        buildscript {
-            repositories {
-                google()
-                mavenCentral()
-            }
-            dependencies {
-                classpath 'com.android.tools.build:gradle:7.4.2'
-            }
-        }
-        allprojects {
-            repositories {
-                google()
-                mavenCentral()
-            }
-        }
-        EOF
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-        # 5. 动态写入 settings.gradle (挂载 globalfloat 模块)
-        cat << 'EOF' > android/settings.gradle
-        include ':globalfloat'
-        EOF
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
 
-    # 5. 执行 Gradle 编译
-    - name: Build Submodule with Gradle
-      run: |
-        cd android
-        gradle :globalfloat:assembleRelease
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
-    # 6. 收集编译出来的 AAR 产物
-    - name: Upload AAR Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: UniApp-Plugin-AARs
-        path: |
-          android/globalfloat/build/outputs/aar/*-release.aar
-          android/globalfloat/build/outputs/aar/*.aar
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Assemble release AAR
+        run: gradle :android:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect GlobalFloat.aar
+        run: |
+          SRC=$(ls android/build/outputs/aar/*.aar | head -n 1)
+          echo "Found: $SRC"
+          cp "$SRC" android/GlobalFloat.aar
+          cp "$SRC" "${GITHUB_WORKSPACE}/GlobalFloat.aar"
+          ls -lh android/GlobalFloat.aar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlobalFloat-aar
+          path: GlobalFloat.aar
+          if-no-files-found: error
+          retention-days: 30
