@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace 'uni.dcloud.globalfloat'
-    compileSdk 33
+    compileSdk 34
 
     defaultConfig {
         minSdk 21
@@ -15,11 +15,19 @@ android {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src/main/java']
+        }
+    }
 }
 
 dependencies {
-    // 将 uni-app 离线 SDK 中的 uniapp-release.aar 复制到本目录 libs/ 下
-    compileOnly fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    // CI 会从 uniapp-v8-release.aar 抽出 libs/uniapp-classes.jar
+    // 本地若没有 jar，可先手动解压 aar 得到 classes.jar 并改名
+    compileOnly files('libs/uniapp-classes.jar')
     compileOnly 'com.alibaba:fastjson:1.2.83'
     implementation 'androidx.appcompat:appcompat:1.6.1'
 }

@@ -13,6 +13,8 @@ import android.database.ContentObserver;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -20,9 +22,16 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -50,14 +59,13 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * 真正的前台服务：后台扫描截屏 → 阿里云 OCR → 题库定位 → DeepSeek → 悬浮通知
+ * 真正的前台服务：后台扫描截屏 → 阿里云 OCR → 题库定位 → DeepSeek → 系统悬浮窗显示答案
  * 不依赖 UniApp WebView JS（单屏后台 JS 会被 pauseTimers）。
  */
 public class ScreenshotGuardService extends Service {
     private static final String TAG = "ScreenshotGuard";
     private static final String PREF = "zuobi_screenshot_guard";
     private static final String CHANNEL_GUARD = "zuobi_guard_fgs";
-    private static final String CHANNEL_RESULT = "zuobi_guard_result";
     private static final int NOTIFY_FGS = 30101;
     private static final int NOTIFY_RESULT = 30102;
 
@@ -70,6 +78,10 @@ public class ScreenshotGuardService extends Service {
     private boolean processing = false;
     private long lastHandledId = 0L;
     private long watchStartMs = 0L;
+
+    private WindowManager answerWindowManager;
+    private View answerOverlay;
+    private Runnable answerDismissRunnable;
 
     private String accessKeyId = "";
     private String accessKeySecret = "";
@@ -130,7 +142,7 @@ public class ScreenshotGuardService extends Service {
         registerObserver();
         workerHandler.removeCallbacks(pollRunnable);
         workerHandler.post(pollRunnable);
-        return START_STICKY;
+        return START_NOT_STICKY;
     }
 
     private void loadPrefs() {
@@ -150,6 +162,10 @@ public class ScreenshotGuardService extends Service {
         running = false;
         unregisterObserver();
         if (workerHandler != null) workerHandler.removeCallbacksAndMessages(null);
+        if (mainHandler != null) {
+            mainHandler.removeCallbacksAndMessages(null);
+            mainHandler.post(this::hideAnswerOverlay);
+        }
         if (workerThread != null) {
             workerThread.quitSafely();
             workerThread = null;
@@ -286,22 +302,34 @@ public class ScreenshotGuardService extends Service {
                     return;
                 }
                 String cleaned = cleanOcr(ocrText);
-                JSONObject matched = matchQuestion(cleaned);
-                JSONObject question = matched != null ? matched : buildFallbackQuestion(cleaned);
+                JSONObject ocrOptions = extractOptions(cleaned);
+                String stem = extractStem(cleaned);
+                JSONObject matched = matchQuestion(stem, ocrOptions);
+                if (matched == null) {
+                    notifyResult("未匹配题库", "选项指纹未命中题库真题，已拒绝作答");
+                    Log.w(TAG, "bank miss stem=" + trim(stem, 80) + " opts=" + ocrOptions);
+                    return;
+                }
+                // 只喂题库真题（题干+选项），OCR 仅用于检索消歧
+                JSONObject question = matched;
                 String answer = askDeepSeek(question);
                 if (TextUtils.isEmpty(answer)) {
                     notifyResult("未识别到", "DeepSeek 无答案");
                     return;
                 }
                 String display = formatAnswer(question, answer);
-                notifyResult("答案 · " + trim(display, 40), display);
+                long qid = matched.optLong("id", 0);
+                String overlayTitle = qid > 0 ? ("原生题库#" + qid) : "原生题库作答";
+                notifyResult(overlayTitle + " · " + trim(display, 28), display, overlayTitle);
                 SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
                 sp.edit()
                     .putString("lastAnswer", display)
                     .putString("lastOcr", cleaned)
                     .putLong("lastAt", System.currentTimeMillis())
+                    .putLong("lastQid", qid)
                     .apply();
-                Log.i(TAG, "done source=" + source + " answer=" + display);
+                Log.i(TAG, "done source=" + source + " qid=" + qid + " optScore="
+                    + matched.optDouble("optionScore", 0) + " answer=" + display);
             } catch (Throwable t) {
                 Log.e(TAG, "process failed", t);
                 notifyResult("未识别到", safeMsg(t));
@@ -467,48 +495,273 @@ public class ScreenshotGuardService extends Service {
 
     private String cleanOcr(String raw) {
         if (raw == null) return "";
-        String[] lines = raw.replace("\r", "\n").split("\n+");
-        StringBuilder body = new StringBuilder();
-        for (String line : lines) {
+        String[] parts = raw.replace("\r", "\n").split("\n+");
+        List<String> lines = new ArrayList<>();
+        for (String line : parts) {
             String t = line.replaceAll("\\s+", " ").trim();
-            if (t.isEmpty() || t.length() <= 1) continue;
-            if (t.matches("^\\d{1,2}:\\d{2}.*")) continue;
-            if (t.matches("^(返回|提交|下一题|上一题|确定|取消|关闭)$")) continue;
-            if (t.contains("按住") && t.contains("语音")) continue;
-            if (body.length() > 0) body.append('\n');
-            body.append(t);
+            if (isNoiseLine(t)) continue;
+            lines.add(t);
         }
-        return body.toString().trim();
+        if (lines.isEmpty()) return "";
+
+        // 找最佳选项簇
+        List<int[]> hits = new ArrayList<>(); // [index]
+        List<String> keys = new ArrayList<>();
+        List<String> texts = new ArrayList<>();
+        for (int i = 0; i < lines.size(); i++) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^([A-Fa-f])[\\.、．\\s)）]+(.+)$")
+                .matcher(lines.get(i));
+            if (m.find()) {
+                hits.add(new int[]{i});
+                keys.add(m.group(1).toUpperCase(Locale.ROOT));
+                texts.add(m.group(2).trim());
+            }
+        }
+
+        int clusterStart = -1;
+        int clusterEnd = -1;
+        if (!hits.isEmpty()) {
+            // 简单取含 A 且选项最多的连续簇
+            int bestScore = -1;
+            int i = 0;
+            while (i < hits.size()) {
+                int j = i;
+                while (j + 1 < hits.size() && hits.get(j + 1)[0] - hits.get(j)[0] <= 2) j++;
+                int score = (j - i + 1) * 10;
+                boolean hasA = false;
+                for (int k = i; k <= j; k++) {
+                    if ("A".equals(keys.get(k))) hasA = true;
+                }
+                if (hasA) score += 8;
+                if (score > bestScore) {
+                    bestScore = score;
+                    clusterStart = i;
+                    clusterEnd = j;
+                }
+                i = j + 1;
+            }
+        }
+
+        StringBuilder stem = new StringBuilder();
+        JSONObject options = new JSONObject();
+        try {
+            if (clusterStart >= 0) {
+                int firstOptLine = hits.get(clusterStart)[0];
+                List<String> stemLines = new ArrayList<>();
+                for (int i = firstOptLine - 1; i >= 0 && stemLines.size() < 10; i--) {
+                    String t = lines.get(i);
+                    if (t.matches("^[A-Fa-f][\\.、．\\s)）].*")) break;
+                    stemLines.add(0, t);
+                }
+                for (String t : stemLines) {
+                    if (stem.length() > 0) stem.append('\n');
+                    stem.append(t);
+                }
+                for (int k = clusterStart; k <= clusterEnd; k++) {
+                    if (!options.has(keys.get(k))) options.put(keys.get(k), texts.get(k));
+                }
+            } else {
+                // 填空/简答：围绕空白符或最长题干行取块，不要整屏杂字
+                int center = 0;
+                int bestScore = -1;
+                for (int i = 0; i < lines.size(); i++) {
+                    String t = lines.get(i);
+                    int s = Math.min(t.length(), 80);
+                    if (looksLikeBlankText(t)) s += 40;
+                    if (looksLikeShortText(t)) s += 25;
+                    if (t.endsWith("？") || t.endsWith("?") || t.contains("根据") || t.contains("规定")) s += 15;
+                    if (t.length() < 6) s -= 20;
+                    if (s > bestScore) {
+                        bestScore = s;
+                        center = i;
+                    }
+                }
+                int from = center;
+                int to = center;
+                while (from > 0 && (center - from + 1) < 12) {
+                    from--;
+                    if (lines.get(from).matches("^[A-Fa-f][\\.、．\\s)）].*")) {
+                        from++;
+                        break;
+                    }
+                }
+                while (to + 1 < lines.size() && (to - from + 1) < 14) {
+                    String next = lines.get(to + 1);
+                    if (next.matches("^[A-Fa-f][\\.、．\\s)）].*")) break;
+                    if (next.length() <= 4 && !looksLikeBlankText(next)) break;
+                    to++;
+                }
+                for (int i = from; i <= to; i++) {
+                    if (stem.length() > 0) stem.append('\n');
+                    stem.append(lines.get(i));
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        StringBuilder out = new StringBuilder(stem.toString().trim());
+        try {
+            List<String> oks = new ArrayList<>();
+            Iterator<String> it = options.keys();
+            while (it.hasNext()) oks.add(it.next());
+            Collections.sort(oks);
+            for (String k : oks) {
+                if (out.length() > 0) out.append('\n');
+                out.append(k).append(". ").append(options.optString(k, ""));
+            }
+        } catch (Throwable ignored) {
+        }
+        return out.toString().trim();
     }
 
-    private JSONObject matchQuestion(String cleaned) {
+    private boolean isNoiseLine(String t) {
+        if (t == null || t.isEmpty() || t.length() <= 1) return true;
+        if (t.matches("^\\d{1,2}:\\d{2}.*")) return true;
+        if (t.matches("^(返回|提交|下一题|上一题|确定|取消|关闭|交卷|暂存|分享|收藏)$")) return true;
+        if (t.matches("^(首页|我的|设置|消息|题库|练习|考试|答题卡|标记)$")) return true;
+        if (t.matches("^第?\\s*\\d+\\s*[/／]\\s*\\d+\\s*题?$")) return true;
+        if (t.startsWith("倒计时") || t.startsWith("剩余时间") || t.startsWith("已用时")) return true;
+        if (t.contains("按住") && t.contains("语音")) return true;
+        if (t.contains("AI") && t.contains("匹配")) return true;
+        return false;
+    }
+
+    private boolean looksLikeBlankText(String t) {
+        if (t == null) return false;
+        return t.matches(".*(_{2,}|…{2,}|\\.{4,}|（\\s*）|\\(\\s*\\)|【\\s*】|＿{2,}|空白处|填入|填写|填空).*");
+    }
+
+    private boolean looksLikeShortText(String t) {
+        if (t == null) return false;
+        return t.contains("简答") || t.contains("简述") || t.contains("论述") || t.contains("请说明") || t.contains("请分析");
+    }
+
+    private void applyOpenType(JSONObject q, String text) throws Exception {
+        if (looksLikeBlankText(text)) {
+            q.put("type", "fill_blank");
+            q.put("typeLabel", "考试填空");
+        } else if (looksLikeShortText(text)) {
+            q.put("type", "short_answer");
+            q.put("typeLabel", "考试简答");
+        } else {
+            q.put("type", "fill_blank");
+            q.put("typeLabel", "考试填空");
+        }
+    }
+
+    private JSONObject extractOptions(String cleaned) {
+        JSONObject options = new JSONObject();
+        if (cleaned == null) return options;
+        try {
+            for (String line : cleaned.split("\n+")) {
+                String t = line.trim();
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("^([A-Fa-f])[\\.、．\\s)）]+(.+)$")
+                    .matcher(t);
+                if (m.find()) {
+                    options.put(m.group(1).toUpperCase(Locale.ROOT), m.group(2).trim());
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return options;
+    }
+
+    private JSONObject buildQuestionForAi(String cleaned, String stem, JSONObject ocrOptions, JSONObject matched) throws Exception {
+        // 已废弃：processUri 只接受题库命中结果
+        if (matched != null) return matched;
+        return buildFallbackQuestion(cleaned);
+    }
+
+    /**
+     * 题库匹配：有 OCR 选项时以选项指纹锁定真题，避免同标题串题（如 BC）。
+     * 未命中或选项对不上则返回 null，禁止拿脏 OCR 硬答。
+     */
+    private JSONObject matchQuestion(String stem, JSONObject ocrOptions) {
         try {
             String jsonText = readFileText(questionsPath);
             if (TextUtils.isEmpty(jsonText)) return null;
             JSONObject root = new JSONObject(jsonText);
             JSONArray arr = root.optJSONArray("questions");
             if (arr == null || arr.length() == 0) return null;
-            String stem = extractStem(cleaned);
-            String query = TextUtils.isEmpty(stem) ? cleaned : stem;
-            double best = 0;
-            JSONObject bestQ = null;
+
+            boolean hasOcrOpts = ocrOptions != null && ocrOptions.length() >= 2;
+            String query = TextUtils.isEmpty(stem) ? "" : stem;
+
+            double bestOpt = 0;
+            JSONObject bestOptQ = null;
+            double bestScore = 0;
+            JSONObject bestScoreQ = null;
+            double bestScoreOpt = 0;
+
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject q = arr.optJSONObject(i);
                 if (q == null) continue;
-                double score = score(query, q.optString("title", ""));
-                if (score > best) {
-                    best = score;
-                    bestQ = q;
+                JSONObject qOpts = q.optJSONObject("options");
+                double opt = scoreOptions(ocrOptions, qOpts);
+                double title = scoreTitle(query, q.optString("title", ""));
+                double score = combineScore(title, opt, hasOcrOpts);
+
+                if (opt > bestOpt) {
+                    bestOpt = opt;
+                    bestOptQ = q;
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestScoreQ = q;
+                    bestScoreOpt = opt;
                 }
             }
-            if (bestQ != null && best >= matchThreshold) {
-                JSONObject out = new JSONObject();
-                out.put("title", bestQ.optString("title", ""));
-                out.put("typeLabel", bestQ.optString("typeLabel", bestQ.optString("type", "题目")));
-                out.put("options", bestQ.optJSONObject("options"));
-                out.put("match", best);
-                return out;
+
+            JSONObject chosen = null;
+            double chosenOpt = 0;
+            double chosenScore = 0;
+
+            // 选项高度重合：直接锁定，标题再像另一套也无效
+            if (hasOcrOpts && bestOpt >= 0.75 && bestOptQ != null) {
+                chosen = bestOptQ;
+                chosenOpt = bestOpt;
+                chosenScore = combineScore(scoreTitle(query, bestOptQ.optString("title", "")), bestOpt, true);
+            } else if (bestScoreQ != null && bestScore >= matchThreshold) {
+                if (hasOcrOpts && bestScoreOpt < 0.75) {
+                    Log.w(TAG, "reject title-only match, optionScore=" + bestScoreOpt);
+                    return null;
+                }
+                if (!hasOcrOpts) {
+                    // 无选项时同标题多套拒绝
+                    String titleKey = normalize(bestScoreQ.optString("title", ""));
+                    if (titleKey.length() > 36) titleKey = titleKey.substring(0, 36);
+                    int same = 0;
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject q = arr.optJSONObject(i);
+                        if (q == null) continue;
+                        String t = normalize(q.optString("title", ""));
+                        if (t.length() > 36) t = t.substring(0, 36);
+                        if (t.equals(titleKey)) same++;
+                    }
+                    if (same > 1) {
+                        Log.w(TAG, "ambiguous same title count=" + same);
+                        return null;
+                    }
+                }
+                chosen = bestScoreQ;
+                chosenOpt = bestScoreOpt;
+                chosenScore = bestScore;
             }
+
+            if (chosen == null) return null;
+
+            JSONObject out = new JSONObject();
+            out.put("id", chosen.optLong("id", 0));
+            out.put("title", chosen.optString("title", ""));
+            out.put("type", chosen.optString("type", ""));
+            out.put("typeLabel", chosen.optString("typeLabel", chosen.optString("type", "题目")));
+            out.put("options", chosen.optJSONObject("options") != null
+                ? chosen.optJSONObject("options") : new JSONObject());
+            out.put("match", chosenScore);
+            out.put("optionScore", chosenOpt);
+            return out;
         } catch (Throwable t) {
             Log.w(TAG, "match failed", t);
         }
@@ -518,8 +771,8 @@ public class ScreenshotGuardService extends Service {
     private JSONObject buildFallbackQuestion(String cleaned) throws Exception {
         JSONObject q = new JSONObject();
         q.put("title", cleaned);
-        q.put("typeLabel", "截图识别");
         q.put("options", new JSONObject());
+        applyOpenType(q, cleaned);
         return q;
     }
 
@@ -527,31 +780,101 @@ public class ScreenshotGuardService extends Service {
         StringBuilder sb = new StringBuilder();
         for (String line : cleaned.split("\n+")) {
             String t = line.trim();
-            if (t.matches("^[A-Fa-f][\\.、．\\s].*")) continue;
+            if (t.matches("^[A-Fa-f][\\.、．\\s)）].*")) continue;
             sb.append(t);
         }
         String s = sb.toString();
         return s.length() > 200 ? s.substring(0, 200) : s;
     }
 
-    private double score(String query, String title) {
+    private double scoreOptionsAligned(JSONObject ocrOptions, JSONObject questionOptions) {
+        if (ocrOptions == null || questionOptions == null || ocrOptions.length() == 0) return 0;
+        try {
+            int hits = 0;
+            int total = 0;
+            Iterator<String> it = ocrOptions.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                String a = normalize(ocrOptions.optString(k, ""));
+                if (a.isEmpty()) continue;
+                total++;
+                String b = normalize(questionOptions.optString(k, ""));
+                if (b.isEmpty()) continue;
+                if (a.equals(b) || a.contains(b) || b.contains(a)) hits++;
+            }
+            return total == 0 ? 0 : (hits * 1.0 / total);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private double scoreOptionsBag(JSONObject ocrOptions, JSONObject questionOptions) {
+        if (ocrOptions == null || questionOptions == null) return 0;
+        try {
+            List<String> a = new ArrayList<>();
+            List<String> b = new ArrayList<>();
+            Iterator<String> it = ocrOptions.keys();
+            while (it.hasNext()) {
+                String n = normalize(ocrOptions.optString(it.next(), ""));
+                if (!n.isEmpty()) a.add(n);
+            }
+            Iterator<String> it2 = questionOptions.keys();
+            while (it2.hasNext()) {
+                String n = normalize(questionOptions.optString(it2.next(), ""));
+                if (!n.isEmpty()) b.add(n);
+            }
+            if (a.isEmpty() || b.isEmpty()) return 0;
+            int hits = 0;
+            for (String x : a) {
+                for (String y : b) {
+                    if (x.equals(y) || x.contains(y) || y.contains(x)) {
+                        hits++;
+                        break;
+                    }
+                }
+            }
+            return hits * 1.0 / Math.max(a.size(), b.size());
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private double scoreOptions(JSONObject ocrOptions, JSONObject questionOptions) {
+        return Math.max(scoreOptionsAligned(ocrOptions, questionOptions),
+            scoreOptionsBag(ocrOptions, questionOptions) * 0.95);
+    }
+
+    private double scoreTitle(String query, String title) {
         String qn = normalize(query);
         String tn = normalize(title);
         if (qn.isEmpty() || tn.isEmpty()) return 0;
         if (tn.contains(qn) && qn.length() >= 8) return 0.95;
         if (qn.contains(tn) && tn.length() >= 8) return 0.92;
-        String head = tn.length() > 40 ? tn.substring(0, 40) : tn;
+        String head = tn.length() > 48 ? tn.substring(0, 48) : tn;
         if (head.length() >= 10 && qn.contains(head)) return 0.88;
         int hits = 0;
-        int sampleLen = Math.min(60, qn.length());
+        int sampleLen = Math.min(80, qn.length());
         for (int i = 0; i < sampleLen; i++) {
             if (tn.indexOf(qn.charAt(i)) >= 0) hits++;
         }
         return sampleLen == 0 ? 0 : (hits * 1.0 / sampleLen) * 0.7;
     }
 
+    private double combineScore(double titleScore, double optScore, boolean hasOcrOpts) {
+        if (!hasOcrOpts) return titleScore;
+        if (optScore >= 0.99) return 0.99;
+        if (optScore >= 0.75) return 0.55 * titleScore + 0.45 * optScore + 0.35;
+        if (optScore >= 0.5) return titleScore * 0.25 + optScore * 0.75;
+        return titleScore * 0.2 + optScore * 0.15;
+    }
+
+    private double score(String query, String title, JSONObject ocrOptions, JSONObject questionOptions) {
+        return combineScore(scoreTitle(query, title), scoreOptions(ocrOptions, questionOptions),
+            ocrOptions != null && ocrOptions.length() >= 2);
+    }
+
     private String normalize(String text) {
-        return text == null ? "" : text.replaceAll("[，。！？、；：\"\"''（）《》【】\\s?？,.!;:'\"()\\[\\]{}]", "").toLowerCase(Locale.ROOT);
+        return text == null ? "" : text.replaceAll("[，。！？、；：\"\"''（）《》【】\\s?？,.!;:'\"()\\[\\]{}＿_…—－·]", "").toLowerCase(Locale.ROOT);
     }
 
     private String askDeepSeek(JSONObject question) throws Exception {
@@ -569,20 +892,39 @@ public class ScreenshotGuardService extends Service {
             }
         }
         if (optionBlock.length() == 0) optionBlock.append("（无选项，请直接给文字答案）");
+        boolean isMulti = typeLabel.contains("多选") || "multiple_choice".equals(question.optString("type"));
+        boolean isOpen = options == null || options.length() == 0
+            || typeLabel.contains("填空") || typeLabel.contains("简答")
+            || "fill_blank".equals(question.optString("type"))
+            || "short_answer".equals(question.optString("type"));
 
-        String prompt = "你是严谨的考试答题助手。根据题目作答，不要输出分析过程。\n"
+        String prompt = "你是严谨的中国证券监管/并购重组考试答题助手。\n"
+            + "必须依据题干与选项本身判断，不要臆造不存在的条文。\n"
+            + "忽略截图里可能混入的界面文字（返回、交卷、倒计时、题号、工具栏等），只答当前这一道题。\n"
             + "输出要求：\n"
             + "- 单选题：只输出一个选项字母，如 C\n"
-            + "- 多选题：只输出字母组合（按字母序），如 ABD\n"
-            + "- 填空/简答：只输出最终答案正文，尽量简短\n"
+            + "- 多选题：只输出全部正确选项字母（按字母序），如 AD\n"
+            + "- 填空题：只输出应填入空白处的词语/数字/短句，不要展开解释\n"
+            + "- 简答题：只输出要点正文，尽量简短\n"
             + "- 不要输出「答案是」等前缀，不要解释\n\n"
+            + (isMulti
+                ? ("多选题判断提示：\n"
+                + "- 先排除明显违法/不合规干扰项，例如：仅需董事长个人决定、重组完成后再披露、无需审议、无需信息披露、不需要聘机构等\n"
+                + "- 优先选择符合监管常识的表述，例如：应当符合产业政策、现金购买不适用发股审核程序、真实准确完整披露、履行审议与披露义务等\n"
+                + "- 有几个选几个，不要勉强凑数\n\n")
+                : "")
+            + (isOpen
+                ? ("填空/简答提示：\n"
+                + "- 题干里的 ______ / （） / 空白 即为作答位置\n"
+                + "- 优先给出可直接填入的标准表述（期限、比例、机构名称、条文关键词等）\n\n")
+                : "")
             + "题型：" + typeLabel + "\n"
-            + "题目：" + title + "\n"
+            + "题目（来自题库原文，请严格按此题干与选项作答）：" + title + "\n"
             + "选项：\n" + optionBlock;
 
         JSONObject body = new JSONObject();
         body.put("model", deepseekModel);
-        body.put("temperature", 0.2);
+        body.put("temperature", 0.1);
         body.put("max_tokens", 256);
         JSONArray messages = new JSONArray();
         messages.put(new JSONObject().put("role", "system").put("content", "你只输出考试答案本身，不输出分析。"));
@@ -611,12 +953,21 @@ public class ScreenshotGuardService extends Service {
         JSONArray choices = json.optJSONArray("choices");
         if (choices == null || choices.length() == 0) return "";
         String content = choices.getJSONObject(0).optJSONObject("message").optString("content", "").trim();
-        return parseAnswer(content);
+        return parseAnswer(content, question);
     }
 
-    private String parseAnswer(String content) {
+    private String parseAnswer(String content, JSONObject question) {
         String text = content == null ? "" : content.trim();
         text = text.replaceFirst("(?i)^答案[:：\\s]*", "").trim();
+        String typeLabel = question == null ? "" : question.optString("typeLabel", "");
+        String type = question == null ? "" : question.optString("type", "");
+        JSONObject options = question == null ? null : question.optJSONObject("options");
+        boolean isOpen = options == null || options.length() == 0
+            || typeLabel.contains("填空") || typeLabel.contains("简答")
+            || "fill_blank".equals(type) || "short_answer".equals(type);
+        if (isOpen) {
+            return text.length() > 200 ? text.substring(0, 200) : text;
+        }
         if (text.matches("(?i)^[A-Fa-f]{2,6}$")) return text.toUpperCase(Locale.ROOT);
         if (text.length() <= 8 && text.matches(".*\\b([A-Fa-f])\\b.*")) {
             java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b([A-Fa-f])\\b").matcher(text);
@@ -691,32 +1042,35 @@ public class ScreenshotGuardService extends Service {
     }
 
     private void notifyResult(String title, String content) {
+        notifyResult(title, content, title);
+    }
+
+    private void notifyResult(String title, String content, String overlayTitle) {
+        // 主线程弹真正的系统悬浮窗（覆盖在其它 App 上），不是通知栏普通弹框
+        if (mainHandler != null) {
+            final String t = overlayTitle == null ? (title == null ? "" : title) : overlayTitle;
+            final String c = content == null ? "" : content;
+            mainHandler.post(() -> showAnswerOverlay(t, c));
+        }
+        // 顺带发一条低调通知，方便回看；不抢悬浮样式
         try {
             NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_RESULT,
-                    "搜题结果悬浮提醒",
-                    NotificationManager.IMPORTANCE_HIGH
+                    "zuobi_guard_result_quiet",
+                    "搜题结果记录",
+                    NotificationManager.IMPORTANCE_DEFAULT
                 );
-                channel.enableVibration(true);
                 manager.createNotificationChannel(channel);
             }
             Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
-            PendingIntent pi = PendingIntent.getActivity(
-                this,
-                1,
-                launchIntent,
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                    ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
-                    : PendingIntent.FLAG_UPDATE_CURRENT
-            );
+            int piFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+                : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getActivity(this, 1902, launchIntent, piFlags);
             Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, CHANNEL_RESULT)
+                ? new Notification.Builder(this, "zuobi_guard_result_quiet")
                 : new Notification.Builder(this);
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                builder.setPriority(Notification.PRIORITY_HIGH);
-            }
             Notification notification = builder
                 .setContentTitle(title)
                 .setContentText(content)
@@ -724,12 +1078,111 @@ public class ScreenshotGuardService extends Service {
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentIntent(pi)
                 .setAutoCancel(true)
-                .setDefaults(Notification.DEFAULT_ALL)
+                .setPriority(Notification.PRIORITY_DEFAULT)
                 .build();
-            manager.notify(NOTIFY_RESULT + (int) (System.currentTimeMillis() % 1000), notification);
+            manager.notify(NOTIFY_RESULT + (int) (System.currentTimeMillis() % 900), notification);
         } catch (Throwable t) {
-            Log.w(TAG, "notify result failed", t);
+            Log.w(TAG, "quiet notify failed", t);
         }
+    }
+
+    private void showAnswerOverlay(String title, String content) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                Log.w(TAG, "无悬浮窗权限，无法显示答案悬浮框");
+                // 尝试引导授权
+                try {
+                    Intent intent = new Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName())
+                    );
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
+                } catch (Throwable ignored) {
+                }
+                return;
+            }
+
+            hideAnswerOverlay();
+
+            answerWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+            LinearLayout panel = new LinearLayout(this);
+            panel.setOrientation(LinearLayout.VERTICAL);
+            panel.setBackgroundColor(0xEE0B1020);
+            int pad = dp(16);
+            panel.setPadding(pad, pad, pad, pad);
+
+            TextView titleView = new TextView(this);
+            titleView.setText(TextUtils.isEmpty(title) ? "答案" : title);
+            titleView.setTextColor(0xFF94A3B8);
+            titleView.setTextSize(13);
+            panel.addView(titleView);
+
+            TextView answerView = new TextView(this);
+            answerView.setText(content);
+            answerView.setTextColor(0xFF4ADE80);
+            answerView.setTextSize(22);
+            answerView.setPadding(0, dp(8), 0, dp(4));
+            panel.addView(answerView);
+
+            TextView tipView = new TextView(this);
+            tipView.setText("点击关闭 · 8 秒后自动消失");
+            tipView.setTextColor(0xFF64748B);
+            tipView.setTextSize(11);
+            panel.addView(tipView);
+
+            panel.setOnClickListener(v -> hideAnswerOverlay());
+
+            int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                PixelFormat.TRANSLUCENT
+            );
+            lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+            lp.y = dp(48);
+            lp.x = 0;
+            int margin = dp(12);
+            lp.width = getResources().getDisplayMetrics().widthPixels - margin * 2;
+
+            answerOverlay = panel;
+            answerWindowManager.addView(panel, lp);
+
+            if (answerDismissRunnable != null) {
+                mainHandler.removeCallbacks(answerDismissRunnable);
+            }
+            answerDismissRunnable = this::hideAnswerOverlay;
+            mainHandler.postDelayed(answerDismissRunnable, 8000);
+        } catch (Throwable t) {
+            Log.e(TAG, "showAnswerOverlay failed", t);
+        }
+    }
+
+    private void hideAnswerOverlay() {
+        try {
+            if (answerDismissRunnable != null && mainHandler != null) {
+                mainHandler.removeCallbacks(answerDismissRunnable);
+                answerDismissRunnable = null;
+            }
+            if (answerWindowManager != null && answerOverlay != null) {
+                answerWindowManager.removeView(answerOverlay);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            answerOverlay = null;
+        }
+    }
+
+    private int dp(int value) {
+        float density = getResources().getDisplayMetrics().density;
+        return Math.round(value * density);
     }
 
     private static String readFileText(String path) throws Exception {

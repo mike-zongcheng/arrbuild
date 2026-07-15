@@ -1,8 +1,8 @@
 {
   "name": "GlobalFloat",
   "id": "GlobalFloat",
-  "version": "1.0.0",
-  "description": "Android 全局悬浮窗（退出应用后仍显示）",
+  "version": "1.1.0",
+  "description": "Android 全局悬浮窗 + 截屏守护（选项指纹匹配题库，避免同标题串题）",
   "_dp_type": "nativeplugin",
   "_dp_nativeplugin": {
     "android": {

@@ -23,7 +23,37 @@ nativeplugins/GlobalFloat/android/GlobalFloat.aar
 
 ---
 
-## 方法一：Android Studio 离线编译（推荐）
+## 方法〇：用 GitHub Actions 编译（无需本机 Android Studio）
+
+仓库已配置：`.github/workflows/build-aar.yml`
+
+### 前置
+
+确认已提交：
+
+```
+nativeplugins/GlobalFloat/android/libs/uniapp-v8-release.aar
+```
+
+（约 24MB，来自 uni-app Android 离线 SDK）
+
+### 步骤
+
+1. 把代码 push 到 GitHub
+2. 打开仓库 → **Actions** → **Build GlobalFloat AAR** → **Run workflow**
+3. 跑完后点本次 run → **Artifacts** → 下载 `GlobalFloat-aar`
+4. 解压得到 `GlobalFloat.aar`，放到：
+
+```
+nativeplugins/GlobalFloat/android/GlobalFloat.aar
+```
+
+5. HBuilderX：**发行 → 原生 App-云打包 → 打自定义调试基座**
+6. 手机卸载旧基座 → 装新基座 → 用自定义基座运行
+
+---
+
+## 方法一：Android Studio 离线编译
 
 ### 1. 下载 uni-app 离线 SDK
 
