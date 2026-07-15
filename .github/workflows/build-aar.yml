@@ -8,49 +8,64 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. 拉取代码
+    # 1. 拉取你仓库的代码
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    # 2. 设置 JDK 11（对 UniApp 最友好的 Java 版本）
+    # 2. 设置 JDK 11 (UniApp 编译最稳定的 Java 版本)
     - name: Set up JDK 11
       uses: actions/setup-java@v4
       with:
         distribution: 'zulu'
         java-version: '11'
 
-    # 3. 强制下载并配置兼容的旧版 Gradle (指定 7.2)
-    - name: Setup Gradle 7.2
+    # 3. 强制下载并配置兼容的旧版 Gradle 7.5
+    - name: Setup Gradle 7.5
       uses: gradle/actions/setup-gradle@v4
       with:
-        gradle-version: '7.2'
+        gradle-version: '7.5'
 
-    # 4. 动态生成 settings.gradle，声明全局插件源（解决 plugins 找不到的问题，且不污染 build.gradle）
-    - name: Configure Gradle Plugin Repositories
+    # 4. 关键：在云端动态构建“父项目外壳”，给你的子模块供电
+    - name: Construct Root Project Environment
       run: |
-        cat << 'EOF' > android/settings.gradle
-        pluginManagement {
+        # 1. 将现有的 android 目录改名为子模块目录 globalfloat
+        mv android globalfloat
+        
+        # 2. 创建一个全新的、干净的根目录 android
+        mkdir android
+        
+        # 3. 把子模块移入这个全新的根目录下
+        mv globalfloat android/
+        
+        # 4. 动态生成父项目的 build.gradle (提供 Android 插件环境)
+        cat << 'EOF' > android/build.gradle
+        buildscript {
             repositories {
                 google()
                 mavenCentral()
-                gradlePluginPortal()
+            }
+            dependencies {
+                classpath 'com.android.tools.build:gradle:7.4.2'
             }
         }
-        dependencyResolutionManagement {
-            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+        allprojects {
             repositories {
                 google()
                 mavenCentral()
             }
         }
-        rootProject.name = 'android'
         EOF
 
-    # 5. 使用 Gradle 7.2 进行编译
-    - name: Build with Gradle
+        # 5. 动态生成父项目的 settings.gradle (将 globalfloat 注册为子模块)
+        cat << 'EOF' > android/settings.gradle
+        include ':globalfloat'
+        EOF
+
+    # 5. 使用 Gradle 编译子模块的 Release AAR
+    - name: Build Submodule with Gradle
       run: |
         cd android
-        gradle assembleRelease
+        gradle :globalfloat:assembleRelease
 
     # 6. 收集打包好的 AAR 供下载
     - name: Upload AAR Artifacts
@@ -58,5 +73,5 @@ jobs:
       with:
         name: UniApp-Plugin-AARs
         path: |
-          android/**/build/outputs/aar/*-release.aar
-          android/**/build/outputs/aar/*.aar
+          android/globalfloat/build/outputs/aar/*-release.aar
+          android/globalfloat/build/outputs/aar/*.aar
