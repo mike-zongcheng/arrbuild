@@ -1,6 +1,6 @@
 # 编译 GlobalFloat.aar
-# 支持独立仓库 arrbuild（根目录有 android/）以及 uni-app 内嵌路径
-# 缺少 settings.gradle / 根 build.gradle 时会自动生成
+# 自动生成 Gradle 根文件，并修正 android/build.gradle
+# 从 uniapp-v8-release.aar 抽出 classes.jar 供编译（比 flatDir 更稳）
 
 name: Build GlobalFloat AAR
 
@@ -10,8 +10,6 @@ on:
     paths:
       - 'android/**'
       - 'nativeplugins/GlobalFloat/**'
-      - 'settings.gradle'
-      - 'build.gradle'
       - '.github/workflows/build-aar.yml'
 
 jobs:
@@ -26,74 +24,111 @@ jobs:
         id: proj
         run: |
           if [ -d nativeplugins/GlobalFloat/android ]; then
-            echo "dir=nativeplugins/GlobalFloat" >> "$GITHUB_OUTPUT"
-            echo "Detected: nested nativeplugins/GlobalFloat"
+            DIR="nativeplugins/GlobalFloat"
           elif [ -d android ] && [ -f android/build.gradle ]; then
-            echo "dir=." >> "$GITHUB_OUTPUT"
-            echo "Detected: standalone (android/ at root)"
+            DIR="."
           else
             echo "::error::找不到 android/ 工程目录"
             ls -la
             exit 1
           fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected project dir: $DIR"
 
-      - name: Ensure Gradle root files
+      - name: Prepare Gradle project
         working-directory: ${{ steps.proj.outputs.dir }}
+        shell: python
         run: |
-          python3 <<'PY'
           from pathlib import Path
-          root = Path('.')
-          print('PWD', root.resolve())
-          print('listing:', sorted(p.name for p in root.iterdir()))
+          import zipfile
+          import shutil
 
-          (root / 'settings.gradle').write_text("""pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
+          root = Path('.').resolve()
+          android = root / 'android'
+          libs = android / 'libs'
+          aar = libs / 'uniapp-v8-release.aar'
+          print('root=', root)
+          print('exists aar=', aar.exists(), aar)
 
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
+          if not aar.exists():
+              raise SystemExit('缺少 android/libs/uniapp-v8-release.aar，请提交到仓库')
 
-          rootProject.name = 'GlobalFloat'
-          include ':android'
-          """, encoding='utf-8')
+          # 从 aar 抽出 classes.jar，编译期依赖更稳
+          classes_jar = libs / 'uniapp-classes.jar'
+          with zipfile.ZipFile(aar, 'r') as zf:
+              names = zf.namelist()
+              print('aar entries sample:', names[:20])
+              if 'classes.jar' not in names:
+                  raise SystemExit('uniapp-v8-release.aar 内没有 classes.jar')
+              with zf.open('classes.jar') as src, open(classes_jar, 'wb') as dst:
+                  shutil.copyfileobj(src, dst)
+          print('extracted', classes_jar, 'size=', classes_jar.stat().st_size)
 
-          (root / 'build.gradle').write_text("""buildscript {
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-              dependencies {
-                  classpath 'com.android.tools.build:gradle:8.1.4'
-              }
-          }
+          (root / 'settings.gradle').write_text(
+              "pluginManagement {\n"
+              "    repositories {\n"
+              "        google()\n"
+              "        mavenCentral()\n"
+              "        gradlePluginPortal()\n"
+              "    }\n"
+              "}\n"
+              "dependencyResolutionManagement {\n"
+              "    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)\n"
+              "    repositories {\n"
+              "        google()\n"
+              "        mavenCentral()\n"
+              "    }\n"
+              "}\n"
+              "rootProject.name = 'GlobalFloat'\n"
+              "include ':android'\n",
+              encoding='utf-8',
+          )
 
-          task clean(type: Delete) {
-              delete rootProject.buildDir
-          }
-          """, encoding='utf-8')
+          (root / 'build.gradle').write_text(
+              "plugins {\n"
+              "    id 'com.android.library' version '8.1.4' apply false\n"
+              "}\n",
+              encoding='utf-8',
+          )
 
           (root / 'gradle.properties').write_text(
               "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n"
               "android.useAndroidX=true\n"
               "android.nonTransitiveRClass=true\n",
-              encoding='utf-8'
+              encoding='utf-8',
           )
 
-          aar = root / 'android' / 'libs' / 'uniapp-v8-release.aar'
-          if not aar.exists():
-              raise SystemExit('缺少 android/libs/uniapp-v8-release.aar')
-          print('uniapp aar ok:', aar, 'size=', aar.stat().st_size)
-          print('wrote settings.gradle / build.gradle / gradle.properties')
-          PY
+          # 覆盖模块 build.gradle，避免仓库里旧配置导致插件找不到
+          (android / 'build.gradle').write_text(
+              "plugins {\n"
+              "    id 'com.android.library'\n"
+              "}\n\n"
+              "android {\n"
+              "    namespace 'uni.dcloud.globalfloat'\n"
+              "    compileSdk 34\n\n"
+              "    defaultConfig {\n"
+              "        minSdk 21\n"
+              "        targetSdk 33\n"
+              "    }\n\n"
+              "    compileOptions {\n"
+              "        sourceCompatibility JavaVersion.VERSION_1_8\n"
+              "        targetCompatibility JavaVersion.VERSION_1_8\n"
+              "    }\n\n"
+              "    sourceSets {\n"
+              "        main {\n"
+              "            manifest.srcFile 'AndroidManifest.xml'\n"
+              "            java.srcDirs = ['src/main/java']\n"
+              "        }\n"
+              "    }\n"
+              "}\n\n"
+              "dependencies {\n"
+              "    compileOnly files('libs/uniapp-classes.jar')\n"
+              "    compileOnly 'com.alibaba:fastjson:1.2.83'\n"
+              "    implementation 'androidx.appcompat:appcompat:1.6.1'\n"
+              "}\n",
+              encoding='utf-8',
+          )
+          print('Gradle files ready')
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -117,7 +152,15 @@ jobs:
 
       - name: Assemble release AAR
         working-directory: ${{ steps.proj.outputs.dir }}
-        run: gradle :android:assembleRelease --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle :android:assembleRelease --no-daemon --stacktrace --info 2>&1 | tee /tmp/gradle-build.log
+          # 失败时尽量把关键错误抠出来
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "======== Gradle failure summary ========"
+            grep -E "FAILURE:|error:|FAILED|What went wrong:|Plugin .* was not found|Could not|Compilation failed|^e: " /tmp/gradle-build.log | tail -n 80 || true
+            exit 1
+          fi
 
       - name: Collect GlobalFloat.aar
         working-directory: ${{ steps.proj.outputs.dir }}
