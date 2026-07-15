@@ -1,0 +1,25 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'uni.dcloud.globalfloat'
+    compileSdk 33
+
+    defaultConfig {
+        minSdk 21
+        targetSdk 33
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    // 将 uni-app 离线 SDK 中的 uniapp-release.aar 复制到本目录 libs/ 下
+    compileOnly fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    compileOnly 'com.alibaba:fastjson:1.2.83'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+}

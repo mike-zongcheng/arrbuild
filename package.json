@@ -1,0 +1,28 @@
+{
+  "name": "GlobalFloat",
+  "id": "GlobalFloat",
+  "version": "1.0.0",
+  "description": "Android 全局悬浮窗（退出应用后仍显示）",
+  "_dp_type": "nativeplugin",
+  "_dp_nativeplugin": {
+    "android": {
+      "plugins": [
+        {
+          "type": "module",
+          "name": "GlobalFloat",
+          "class": "uni.dcloud.globalfloat.GlobalFloatModule"
+        }
+      ],
+      "integrateType": "aar",
+      "dependencies": [],
+      "permissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "minSdkVersion": "21"
+    }
+  }
+}
