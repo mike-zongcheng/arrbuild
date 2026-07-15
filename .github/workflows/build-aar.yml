@@ -1,11 +1,6 @@
-# 编译 GlobalFloat.aar（含 ScreenshotGuardService）
-#
-# 支持两种仓库结构：
-# A) 独立仓库 arrbuild（根目录即有 android/、package.json）← 你当前这种
-# B) 嵌在 uni-app 工程里：nativeplugins/GlobalFloat/
-#
-# 用法：Actions → Build GlobalFloat AAR → Run workflow
-# 下载 Artifact：GlobalFloat-aar → 放到 android/GlobalFloat.aar → 打自定义基座
+# 编译 GlobalFloat.aar
+# 支持独立仓库 arrbuild（根目录有 android/）以及 uni-app 内嵌路径
+# 缺少 settings.gradle / 根 build.gradle 时会自动生成
 
 name: Build GlobalFloat AAR
 
@@ -30,36 +25,75 @@ jobs:
       - name: Detect project root
         id: proj
         run: |
-          if [ -f nativeplugins/GlobalFloat/settings.gradle ] && [ -d nativeplugins/GlobalFloat/android ]; then
+          if [ -d nativeplugins/GlobalFloat/android ]; then
             echo "dir=nativeplugins/GlobalFloat" >> "$GITHUB_OUTPUT"
-            echo "Detected layout: uni-app nested (nativeplugins/GlobalFloat)"
+            echo "Detected: nested nativeplugins/GlobalFloat"
           elif [ -d android ] && [ -f android/build.gradle ]; then
             echo "dir=." >> "$GITHUB_OUTPUT"
-            echo "Detected layout: standalone plugin repo (android/ at root)"
+            echo "Detected: standalone (android/ at root)"
           else
-            echo "::error::找不到插件工程。需要根目录有 android/，或存在 nativeplugins/GlobalFloat/"
+            echo "::error::找不到 android/ 工程目录"
             ls -la
             exit 1
           fi
 
-      - name: Check gradle + uniapp aar
+      - name: Ensure Gradle root files
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
-          echo "PWD=$(pwd)"
-          ls -la
-          if [ ! -f settings.gradle ]; then
-            echo "::error::缺少 settings.gradle（请放在插件根目录，与 android/ 同级）"
-            exit 1
-          fi
-          if [ ! -f build.gradle ]; then
-            echo "::error::缺少根目录 build.gradle（请与 android/ 同级）"
-            exit 1
-          fi
-          if [ ! -f android/libs/uniapp-v8-release.aar ]; then
-            echo "::error::缺少 android/libs/uniapp-v8-release.aar"
-            exit 1
-          fi
-          ls -lh android/libs/
+          python3 <<'PY'
+          from pathlib import Path
+          root = Path('.')
+          print('PWD', root.resolve())
+          print('listing:', sorted(p.name for p in root.iterdir()))
+
+          (root / 'settings.gradle').write_text("""pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = 'GlobalFloat'
+          include ':android'
+          """, encoding='utf-8')
+
+          (root / 'build.gradle').write_text("""buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.4'
+              }
+          }
+
+          task clean(type: Delete) {
+              delete rootProject.buildDir
+          }
+          """, encoding='utf-8')
+
+          (root / 'gradle.properties').write_text(
+              "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n"
+              "android.useAndroidX=true\n"
+              "android.nonTransitiveRClass=true\n",
+              encoding='utf-8'
+          )
+
+          aar = root / 'android' / 'libs' / 'uniapp-v8-release.aar'
+          if not aar.exists():
+              raise SystemExit('缺少 android/libs/uniapp-v8-release.aar')
+          print('uniapp aar ok:', aar, 'size=', aar.stat().st_size)
+          print('wrote settings.gradle / build.gradle / gradle.properties')
+          PY
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -74,8 +108,7 @@ jobs:
         run: yes | sdkmanager --licenses || true
 
       - name: Install SDK packages
-        run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -93,7 +126,7 @@ jobs:
           echo "Found: $SRC"
           cp "$SRC" android/GlobalFloat.aar
           cp "$SRC" "${GITHUB_WORKSPACE}/GlobalFloat.aar"
-          ls -lh android/GlobalFloat.aar
+          ls -lh "${GITHUB_WORKSPACE}/GlobalFloat.aar"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
