@@ -1,0 +1,41 @@
+name: Build UniApp Android Plugin AAR
+
+on:
+  workflow_dispatch: # 允许你随时手动点击按钮开始打包
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. 拉取你仓库的代码
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    # 2. 设置 JDK 环境（Android 编译必需）
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    # 3. 给 Gradle 执行文件赋予运行权限
+    - name: Grant Execute Permission for Gradlew
+      run: |
+        cd android
+        chmod +x gradlew
+
+    # 4. 编译打包 AAR
+    - name: Build with Gradle
+      run: |
+        cd android
+        ./gradlew assembleRelease
+
+    # 5. 将打包好的 AAR 收集并提供下载
+    - name: Upload AAR Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: UniApp-Plugin-AARs
+        path: |
+          android/**/build/outputs/aar/*-release.aar
+          android/**/build/outputs/aar/*.aar
