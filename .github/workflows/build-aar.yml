@@ -1,10 +1,11 @@
 # 编译 GlobalFloat.aar（含 ScreenshotGuardService）
-# 用法：
-# 1. 确保 nativeplugins/GlobalFloat/android/libs/uniapp-v8-release.aar 已提交到仓库
-# 2. GitHub → Actions → Build GlobalFloat AAR → Run workflow
-# 3. 跑完后在 Artifacts 下载 GlobalFloat.aar
-# 4. 放到本机：nativeplugins/GlobalFloat/android/GlobalFloat.aar
-# 5. HBuilderX 重新打自定义基座
+#
+# 支持两种仓库结构：
+# A) 独立仓库 arrbuild（根目录即有 android/、package.json）← 你当前这种
+# B) 嵌在 uni-app 工程里：nativeplugins/GlobalFloat/
+#
+# 用法：Actions → Build GlobalFloat AAR → Run workflow
+# 下载 Artifact：GlobalFloat-aar → 放到 android/GlobalFloat.aar → 打自定义基座
 
 name: Build GlobalFloat AAR
 
@@ -12,25 +13,50 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - 'android/**'
       - 'nativeplugins/GlobalFloat/**'
+      - 'settings.gradle'
+      - 'build.gradle'
       - '.github/workflows/build-aar.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: nativeplugins/GlobalFloat
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check uniapp aar exists
+      - name: Detect project root
+        id: proj
         run: |
+          if [ -f nativeplugins/GlobalFloat/settings.gradle ] && [ -d nativeplugins/GlobalFloat/android ]; then
+            echo "dir=nativeplugins/GlobalFloat" >> "$GITHUB_OUTPUT"
+            echo "Detected layout: uni-app nested (nativeplugins/GlobalFloat)"
+          elif [ -d android ] && [ -f android/build.gradle ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected layout: standalone plugin repo (android/ at root)"
+          else
+            echo "::error::找不到插件工程。需要根目录有 android/，或存在 nativeplugins/GlobalFloat/"
+            ls -la
+            exit 1
+          fi
+
+      - name: Check gradle + uniapp aar
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          if [ ! -f settings.gradle ]; then
+            echo "::error::缺少 settings.gradle（请放在插件根目录，与 android/ 同级）"
+            exit 1
+          fi
+          if [ ! -f build.gradle ]; then
+            echo "::error::缺少根目录 build.gradle（请与 android/ 同级）"
+            exit 1
+          fi
           if [ ! -f android/libs/uniapp-v8-release.aar ]; then
             echo "::error::缺少 android/libs/uniapp-v8-release.aar"
-            echo "请从 uni-app Android 离线 SDK 复制该文件到 libs/ 并提交到仓库后再跑。"
             exit 1
           fi
           ls -lh android/libs/
@@ -57,9 +83,11 @@ jobs:
           gradle-version: '8.2'
 
       - name: Assemble release AAR
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: gradle :android:assembleRelease --no-daemon --stacktrace
 
       - name: Collect GlobalFloat.aar
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           SRC=$(ls android/build/outputs/aar/*.aar | head -n 1)
           echo "Found: $SRC"
