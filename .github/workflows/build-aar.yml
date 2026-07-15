@@ -1,77 +1,180 @@
-name: Build UniApp Android Plugin AAR
+# 编译 GlobalFloat.aar
+# 自动生成 Gradle 根文件，并修正 android/build.gradle
+# 从 uniapp-v8-release.aar 抽出 classes.jar 供编译（比 flatDir 更稳）
+
+name: Build GlobalFloat AAR
 
 on:
-  workflow_dispatch: # 允许手动点击运行
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - 'nativeplugins/GlobalFloat/**'
+      - '.github/workflows/build-aar.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. 拉取你仓库的代码
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # 2. 设置 JDK 11 (UniApp 编译最稳定的 Java 版本)
-    - name: Set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'zulu'
-        java-version: '11'
+      - name: Detect project root
+        id: proj
+        run: |
+          if [ -d nativeplugins/GlobalFloat/android ]; then
+            DIR="nativeplugins/GlobalFloat"
+          elif [ -d android ] && [ -f android/build.gradle ]; then
+            DIR="."
+          else
+            echo "::error::找不到 android/ 工程目录"
+            ls -la
+            exit 1
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected project dir: $DIR"
 
-    # 3. 强制下载并配置兼容的旧版 Gradle 7.5
-    - name: Setup Gradle 7.5
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        gradle-version: '7.5'
+      - name: Prepare Gradle project
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: python
+        run: |
+          from pathlib import Path
+          import zipfile
+          import shutil
 
-    # 4. 关键：在云端动态构建“父项目外壳”，给你的子模块供电
-    - name: Construct Root Project Environment
-      run: |
-        # 1. 将现有的 android 目录改名为子模块目录 globalfloat
-        mv android globalfloat
-        
-        # 2. 创建一个全新的、干净的根目录 android
-        mkdir android
-        
-        # 3. 把子模块移入这个全新的根目录下
-        mv globalfloat android/
-        
-        # 4. 动态生成父项目的 build.gradle (提供 Android 插件环境)
-        cat << 'EOF' > android/build.gradle
-        buildscript {
-            repositories {
-                google()
-                mavenCentral()
-            }
-            dependencies {
-                classpath 'com.android.tools.build:gradle:7.4.2'
-            }
-        }
-        allprojects {
-            repositories {
-                google()
-                mavenCentral()
-            }
-        }
-        EOF
+          root = Path('.').resolve()
+          android = root / 'android'
+          libs = android / 'libs'
+          aar = libs / 'uniapp-v8-release.aar'
+          print('root=', root)
+          print('exists aar=', aar.exists(), aar)
 
-        # 5. 动态生成父项目的 settings.gradle (将 globalfloat 注册为子模块)
-        cat << 'EOF' > android/settings.gradle
-        include ':globalfloat'
-        EOF
+          if not aar.exists():
+              raise SystemExit('缺少 android/libs/uniapp-v8-release.aar，请提交到仓库')
 
-    # 5. 使用 Gradle 编译子模块的 Release AAR
-    - name: Build Submodule with Gradle
-      run: |
-        cd android
-        gradle :globalfloat:assembleRelease
+          # 从 aar 抽出 classes.jar，编译期依赖更稳
+          classes_jar = libs / 'uniapp-classes.jar'
+          with zipfile.ZipFile(aar, 'r') as zf:
+              names = zf.namelist()
+              print('aar entries sample:', names[:20])
+              if 'classes.jar' not in names:
+                  raise SystemExit('uniapp-v8-release.aar 内没有 classes.jar')
+              with zf.open('classes.jar') as src, open(classes_jar, 'wb') as dst:
+                  shutil.copyfileobj(src, dst)
+          print('extracted', classes_jar, 'size=', classes_jar.stat().st_size)
 
-    # 6. 收集打包好的 AAR 供下载
-    - name: Upload AAR Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: UniApp-Plugin-AARs
-        path: |
-          android/globalfloat/build/outputs/aar/*-release.aar
-          android/globalfloat/build/outputs/aar/*.aar
+          (root / 'settings.gradle').write_text(
+              "pluginManagement {\n"
+              "    repositories {\n"
+              "        google()\n"
+              "        mavenCentral()\n"
+              "        gradlePluginPortal()\n"
+              "    }\n"
+              "}\n"
+              "dependencyResolutionManagement {\n"
+              "    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)\n"
+              "    repositories {\n"
+              "        google()\n"
+              "        mavenCentral()\n"
+              "    }\n"
+              "}\n"
+              "rootProject.name = 'GlobalFloat'\n"
+              "include ':android'\n",
+              encoding='utf-8',
+          )
+
+          (root / 'build.gradle').write_text(
+              "plugins {\n"
+              "    id 'com.android.library' version '8.1.4' apply false\n"
+              "}\n",
+              encoding='utf-8',
+          )
+
+          (root / 'gradle.properties').write_text(
+              "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n"
+              "android.useAndroidX=true\n"
+              "android.nonTransitiveRClass=true\n",
+              encoding='utf-8',
+          )
+
+          # 覆盖模块 build.gradle，避免仓库里旧配置导致插件找不到
+          (android / 'build.gradle').write_text(
+              "plugins {\n"
+              "    id 'com.android.library'\n"
+              "}\n\n"
+              "android {\n"
+              "    namespace 'uni.dcloud.globalfloat'\n"
+              "    compileSdk 34\n\n"
+              "    defaultConfig {\n"
+              "        minSdk 21\n"
+              "        targetSdk 33\n"
+              "    }\n\n"
+              "    compileOptions {\n"
+              "        sourceCompatibility JavaVersion.VERSION_1_8\n"
+              "        targetCompatibility JavaVersion.VERSION_1_8\n"
+              "    }\n\n"
+              "    sourceSets {\n"
+              "        main {\n"
+              "            manifest.srcFile 'AndroidManifest.xml'\n"
+              "            java.srcDirs = ['src/main/java']\n"
+              "        }\n"
+              "    }\n"
+              "}\n\n"
+              "dependencies {\n"
+              "    compileOnly files('libs/uniapp-classes.jar')\n"
+              "    compileOnly 'com.alibaba:fastjson:1.2.83'\n"
+              "    implementation 'androidx.appcompat:appcompat:1.6.1'\n"
+              "}\n",
+              encoding='utf-8',
+          )
+          print('Gradle files ready')
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Assemble release AAR
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -o pipefail
+          gradle :android:assembleRelease --no-daemon --stacktrace --info 2>&1 | tee /tmp/gradle-build.log
+          # 失败时尽量把关键错误抠出来
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "======== Gradle failure summary ========"
+            grep -E "FAILURE:|error:|FAILED|What went wrong:|Plugin .* was not found|Could not|Compilation failed|^e: " /tmp/gradle-build.log | tail -n 80 || true
+            exit 1
+          fi
+
+      - name: Collect GlobalFloat.aar
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          SRC=$(ls android/build/outputs/aar/*.aar | head -n 1)
+          echo "Found: $SRC"
+          cp "$SRC" android/GlobalFloat.aar
+          cp "$SRC" "${GITHUB_WORKSPACE}/GlobalFloat.aar"
+          ls -lh "${GITHUB_WORKSPACE}/GlobalFloat.aar"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlobalFloat-aar
+          path: GlobalFloat.aar
+          if-no-files-found: error
+          retention-days: 30
