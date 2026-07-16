@@ -99,6 +99,21 @@ public class GlobalFloatModule extends UniModule {
         }
     }
 
+    /**
+     * 供 JS 确认基座是否已含 OCR直答 管道（旧基座无此方法或 version 对不上）
+     */
+    @UniJSMethod(uiThread = false)
+    public void getPipelineInfo(UniJSCallback callback) {
+        JSONObject result = new JSONObject();
+        result.put("pipeline", ScreenshotGuardService.PIPELINE);
+        result.put("version", ScreenshotGuardService.PIPELINE_VERSION);
+        result.put("ocrDirect", true);
+        result.put("guardRunning", ScreenshotGuardService.isRunning());
+        if (callback != null) {
+            callback.invoke(result);
+        }
+    }
+
     @UniJSMethod(uiThread = true)
     public void startScreenshotGuard(JSONObject options, UniJSCallback callback) {
         Activity activity = (Activity) mUniSDKInstance.getContext();
@@ -113,10 +128,16 @@ public class GlobalFloatModule extends UniModule {
                 putExtra(intent, options, "deepseekBase");
                 putExtra(intent, options, "deepseekModel");
                 putExtra(intent, options, "questionsPath");
+                putExtra(intent, options, "pipeline");
+                putExtra(intent, options, "pipelineVersion");
                 if (options.containsKey("matchThreshold")) {
                     intent.putExtra("matchThreshold", options.getDoubleValue("matchThreshold"));
                 }
             }
+            // 固定声明当前管道，便于日志辨认
+            intent.putExtra("pipeline", ScreenshotGuardService.PIPELINE);
+            intent.putExtra("pipelineVersion", ScreenshotGuardService.PIPELINE_VERSION);
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 activity.startForegroundService(intent);
             } else {
@@ -125,6 +146,8 @@ public class GlobalFloatModule extends UniModule {
             result.put("code", 0);
             result.put("message", "ok");
             result.put("via", "ScreenshotGuardService");
+            result.put("pipeline", ScreenshotGuardService.PIPELINE);
+            result.put("version", ScreenshotGuardService.PIPELINE_VERSION);
         } catch (Throwable t) {
             result.put("code", -1);
             result.put("message", t.getMessage() == null ? "start failed" : t.getMessage());
@@ -139,12 +162,22 @@ public class GlobalFloatModule extends UniModule {
         Activity activity = (Activity) mUniSDKInstance.getContext();
         JSONObject result = new JSONObject();
         try {
-            Intent intent = new Intent(activity, ScreenshotGuardService.class);
-            intent.putExtra("action", "stop");
+            // 先发 stop action（START_NOT_STICKY + stopSelf），再 stopService
+            Intent stopIntent = new Intent(activity, ScreenshotGuardService.class);
+            stopIntent.putExtra("action", "stop");
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    activity.startForegroundService(stopIntent);
+                } else {
+                    activity.startService(stopIntent);
+                }
+            } catch (Throwable ignored) {
+            }
             activity.stopService(new Intent(activity, ScreenshotGuardService.class));
             result.put("code", 0);
             result.put("message", "ok");
             result.put("running", ScreenshotGuardService.isRunning());
+            result.put("version", ScreenshotGuardService.PIPELINE_VERSION);
         } catch (Throwable t) {
             result.put("code", -1);
             result.put("message", t.getMessage() == null ? "stop failed" : t.getMessage());
@@ -158,6 +191,8 @@ public class GlobalFloatModule extends UniModule {
     public void isScreenshotGuardRunning(UniJSCallback callback) {
         JSONObject result = new JSONObject();
         result.put("running", ScreenshotGuardService.isRunning());
+        result.put("version", ScreenshotGuardService.PIPELINE_VERSION);
+        result.put("pipeline", ScreenshotGuardService.PIPELINE);
         if (callback != null) {
             callback.invoke(result);
         }

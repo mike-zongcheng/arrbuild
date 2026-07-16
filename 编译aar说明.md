@@ -18,8 +18,8 @@ nativeplugins/GlobalFloat/android/GlobalFloat.aar
 
 然后**重新制作自定义基座**。
 
-> 当前插件已包含 `ScreenshotGuardService`：**单屏退到后台**时由原生前台服务扫截屏 → OCR → DeepSeek → 通知，不依赖 WebView JS。
-> 旧基座没有这个 Service 时，日志会提示需重打自定义基座。
+> **v1.3.0**：`ScreenshotGuardService` = 扫截屏 → 阿里云 OCR → **OCR原文直喂 DeepSeek**（不走题库题干匹配）→ 悬浮窗。
+> 新基座浮层标题应为 **`OCR直答·v1.3.0`**；若不是，说明还是旧 AAR。
 
 ---
 
@@ -111,7 +111,14 @@ d:\zuobi\nativeplugins\GlobalFloat\android\GlobalFloat.aar
 当前运行的基座不包含原生插件[GlobalFloat]
 ```
 
-点击「开启全局悬浮窗」能正常弹出，按 Home 键退出后悬浮窗仍在。
+截屏搜题页日志应出现类似：
+
+```
+基座管道: {"ok":true,"version":"1.3.0","pipeline":"ocr_direct","ocrDirect":true}
+原生守护: {"code":0,"version":"1.3.0",...}
+```
+
+浮层标题必须是 **`OCR直答·v1.3.0`**（不是旧的「匹配」类标题）。
 
 ---
 

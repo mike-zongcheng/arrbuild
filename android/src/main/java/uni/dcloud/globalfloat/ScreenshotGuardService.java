@@ -59,11 +59,15 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * 真正的前台服务：后台扫描截屏 → 阿里云 OCR → 题库定位 → DeepSeek → 系统悬浮窗显示答案
+ * 前台服务（v1.3）：后台扫截屏 → 阿里云 OCR → OCR原文直喂 DeepSeek → 系统悬浮窗
+ * 不再依赖题库题干匹配（同标题多套选项会串题）。
  * 不依赖 UniApp WebView JS（单屏后台 JS 会被 pauseTimers）。
  */
 public class ScreenshotGuardService extends Service {
     private static final String TAG = "ScreenshotGuard";
+    /** 与 package.json / JS pipelineVersion 对齐，浮层可辨认新基座 */
+    public static final String PIPELINE_VERSION = "1.3.0";
+    public static final String PIPELINE = "ocr_direct";
     private static final String PREF = "zuobi_screenshot_guard";
     private static final String CHANNEL_GUARD = "zuobi_guard_fgs";
     private static final int NOTIFY_FGS = 30101;
@@ -104,7 +108,7 @@ public class ScreenshotGuardService extends Service {
         workerThread = new HandlerThread("zuobi-shot-guard");
         workerThread.start();
         workerHandler = new Handler(workerThread.getLooper());
-        startAsForeground("截屏搜题守护中", "后台自动识图作答");
+        startAsForeground("截屏搜题·OCR直答", "v" + PIPELINE_VERSION + " 后台识图作答中");
     }
 
     @Override
@@ -301,35 +305,25 @@ public class ScreenshotGuardService extends Service {
                     notifyResult("未识别到", "OCR 无文字");
                     return;
                 }
-                String cleaned = cleanOcr(ocrText);
-                JSONObject ocrOptions = extractOptions(cleaned);
-                String stem = extractStem(cleaned);
-                JSONObject matched = matchQuestion(stem, ocrOptions);
-                if (matched == null) {
-                    notifyResult("未匹配题库", "选项指纹未命中题库真题，已拒绝作答");
-                    Log.w(TAG, "bank miss stem=" + trim(stem, 80) + " opts=" + ocrOptions);
-                    return;
-                }
-                // 只喂题库真题（题干+选项），OCR 仅用于检索消歧
-                JSONObject question = matched;
-                String answer = askDeepSeek(question);
+                // 主路径：OCR 原文直喂 DeepSeek（自行剔除界面污染），不再依赖题库题干匹配
+                String answer = askDeepSeekFromOcr(ocrText);
                 if (TextUtils.isEmpty(answer)) {
                     notifyResult("未识别到", "DeepSeek 无答案");
                     return;
                 }
-                String display = formatAnswer(question, answer);
-                long qid = matched.optLong("id", 0);
-                String overlayTitle = qid > 0 ? ("原生题库#" + qid) : "原生题库作答";
+                String display = answer;
+                String overlayTitle = "OCR直答·v" + PIPELINE_VERSION;
                 notifyResult(overlayTitle + " · " + trim(display, 28), display, overlayTitle);
                 SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
                 sp.edit()
                     .putString("lastAnswer", display)
-                    .putString("lastOcr", cleaned)
+                    .putString("lastOcr", ocrText)
+                    .putString("pipeline", PIPELINE)
+                    .putString("pipelineVersion", PIPELINE_VERSION)
                     .putLong("lastAt", System.currentTimeMillis())
-                    .putLong("lastQid", qid)
                     .apply();
-                Log.i(TAG, "done source=" + source + " qid=" + qid + " optScore="
-                    + matched.optDouble("optionScore", 0) + " answer=" + display);
+                Log.i(TAG, "done source=" + source + " pipeline=" + PIPELINE
+                    + " v=" + PIPELINE_VERSION + " answer=" + display);
             } catch (Throwable t) {
                 Log.e(TAG, "process failed", t);
                 notifyResult("未识别到", safeMsg(t));
@@ -657,10 +651,26 @@ public class ScreenshotGuardService extends Service {
             for (String line : cleaned.split("\n+")) {
                 String t = line.trim();
                 java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("^([A-Fa-f])[\\.、．\\s)）]+(.+)$")
+                    .compile("^([A-Fa-f])[\\.、．\\s)）︰:]+(.+)$")
                     .matcher(t);
                 if (m.find()) {
                     options.put(m.group(1).toUpperCase(Locale.ROOT), m.group(2).trim());
+                    continue;
+                }
+                m = java.util.regex.Pattern.compile("^([A-Fa-f])([\\u4e00-\\u9fff].+)$").matcher(t);
+                if (m.find()) {
+                    options.put(m.group(1).toUpperCase(Locale.ROOT), m.group(2).trim());
+                }
+            }
+            // 同一行挤在一起：A、xx B、yy
+            if (options.length() < 2) {
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?:^|[\\s\\n])([A-Fa-f])[\\.、．\\s)）︰:]+([^A-Fa-f\\n]{2,}?)(?=(?:\\s*[A-Fa-f][\\.、．\\s)）︰:])|$)")
+                    .matcher(" " + cleaned);
+                while (m.find()) {
+                    String k = m.group(1).toUpperCase(Locale.ROOT);
+                    String v = m.group(2).replaceAll("\\s+", " ").trim();
+                    if (!v.isEmpty() && !options.has(k)) options.put(k, v);
                 }
             }
         } catch (Throwable ignored) {
@@ -669,14 +679,12 @@ public class ScreenshotGuardService extends Service {
     }
 
     private JSONObject buildQuestionForAi(String cleaned, String stem, JSONObject ocrOptions, JSONObject matched) throws Exception {
-        // 已废弃：processUri 只接受题库命中结果
         if (matched != null) return matched;
         return buildFallbackQuestion(cleaned);
     }
 
     /**
-     * 题库匹配：有 OCR 选项时以选项指纹锁定真题，避免同标题串题（如 BC）。
-     * 未命中或选项对不上则返回 null，禁止拿脏 OCR 硬答。
+     * 模糊选项指纹 + 题干辅助；门槛放宽，避免 OCR 差一点就全未命中。
      */
     private JSONObject matchQuestion(String stem, JSONObject ocrOptions) {
         try {
@@ -688,66 +696,100 @@ public class ScreenshotGuardService extends Service {
 
             boolean hasOcrOpts = ocrOptions != null && ocrOptions.length() >= 2;
             String query = TextUtils.isEmpty(stem) ? "" : stem;
+            final double OPT_LOCK = 0.42;
+            final double OPT_ACCEPT = 0.35;
 
-            double bestOpt = 0;
-            JSONObject bestOptQ = null;
-            double bestScore = 0;
-            JSONObject bestScoreQ = null;
-            double bestScoreOpt = 0;
-
+            class Cand {
+                JSONObject q;
+                double title;
+                double opt;
+                double score;
+            }
+            List<Cand> all = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject q = arr.optJSONObject(i);
                 if (q == null) continue;
-                JSONObject qOpts = q.optJSONObject("options");
-                double opt = scoreOptions(ocrOptions, qOpts);
-                double title = scoreTitle(query, q.optString("title", ""));
-                double score = combineScore(title, opt, hasOcrOpts);
-
-                if (opt > bestOpt) {
-                    bestOpt = opt;
-                    bestOptQ = q;
-                }
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestScoreQ = q;
-                    bestScoreOpt = opt;
-                }
+                Cand c = new Cand();
+                c.q = q;
+                c.title = scoreTitle(query, q.optString("title", ""));
+                c.opt = scoreOptions(ocrOptions, q.optJSONObject("options"));
+                c.score = combineScore(c.title, c.opt, hasOcrOpts);
+                all.add(c);
             }
 
             JSONObject chosen = null;
             double chosenOpt = 0;
             double chosenScore = 0;
 
-            // 选项高度重合：直接锁定，标题再像另一套也无效
-            if (hasOcrOpts && bestOpt >= 0.75 && bestOptQ != null) {
-                chosen = bestOptQ;
-                chosenOpt = bestOpt;
-                chosenScore = combineScore(scoreTitle(query, bestOptQ.optString("title", "")), bestOpt, true);
-            } else if (bestScoreQ != null && bestScore >= matchThreshold) {
-                if (hasOcrOpts && bestScoreOpt < 0.75) {
-                    Log.w(TAG, "reject title-only match, optionScore=" + bestScoreOpt);
+            if (hasOcrOpts) {
+                List<Cand> pool = new ArrayList<>();
+                for (Cand c : all) {
+                    if (c.title >= 0.45 || c.opt >= OPT_ACCEPT) pool.add(c);
+                }
+                if (pool.isEmpty()) {
+                    for (Cand c : all) {
+                        if (c.title >= 0.3) pool.add(c);
+                    }
+                }
+                Collections.sort(pool, (a, b) -> {
+                    if (Math.abs(b.opt - a.opt) > 0.04) return Double.compare(b.opt, a.opt);
+                    return Double.compare(b.title, a.title);
+                });
+                if (pool.isEmpty()) return null;
+
+                Cand best = pool.get(0);
+                // 同标题消歧
+                String titleKey = normalize(best.q.optString("title", ""));
+                if (titleKey.length() > 36) titleKey = titleKey.substring(0, 36);
+                List<Cand> same = new ArrayList<>();
+                for (Cand c : pool) {
+                    String t = normalize(c.q.optString("title", ""));
+                    if (t.length() > 36) t = t.substring(0, 36);
+                    if (t.equals(titleKey)) same.add(c);
+                }
+                if (same.size() > 1) {
+                    Collections.sort(same, (a, b) -> Double.compare(b.opt, a.opt));
+                    Cand top = same.get(0);
+                    Cand second = same.get(1);
+                    if (top.opt >= OPT_ACCEPT || (top.opt - second.opt) >= 0.08) {
+                        chosen = top.q;
+                        chosenOpt = top.opt;
+                        chosenScore = top.score;
+                    } else if (top.title >= 0.7 && top.opt >= 0.25) {
+                        chosen = top.q;
+                        chosenOpt = top.opt;
+                        chosenScore = top.score;
+                    }
+                } else if (best.opt >= OPT_ACCEPT || best.title >= 0.7) {
+                    chosen = best.q;
+                    chosenOpt = best.opt;
+                    chosenScore = best.score;
+                } else if (best.opt >= OPT_LOCK * 0.8 && best.title >= 0.5) {
+                    chosen = best.q;
+                    chosenOpt = best.opt;
+                    chosenScore = best.score;
+                }
+            } else {
+                Cand best = null;
+                for (Cand c : all) {
+                    if (best == null || c.score > best.score) best = c;
+                }
+                if (best == null || best.score < matchThreshold) return null;
+                String titleKey = normalize(best.q.optString("title", ""));
+                if (titleKey.length() > 36) titleKey = titleKey.substring(0, 36);
+                int same = 0;
+                for (Cand c : all) {
+                    String t = normalize(c.q.optString("title", ""));
+                    if (t.length() > 36) t = t.substring(0, 36);
+                    if (t.equals(titleKey)) same++;
+                }
+                if (same > 1) {
+                    Log.w(TAG, "ambiguous same title count=" + same);
                     return null;
                 }
-                if (!hasOcrOpts) {
-                    // 无选项时同标题多套拒绝
-                    String titleKey = normalize(bestScoreQ.optString("title", ""));
-                    if (titleKey.length() > 36) titleKey = titleKey.substring(0, 36);
-                    int same = 0;
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject q = arr.optJSONObject(i);
-                        if (q == null) continue;
-                        String t = normalize(q.optString("title", ""));
-                        if (t.length() > 36) t = t.substring(0, 36);
-                        if (t.equals(titleKey)) same++;
-                    }
-                    if (same > 1) {
-                        Log.w(TAG, "ambiguous same title count=" + same);
-                        return null;
-                    }
-                }
-                chosen = bestScoreQ;
-                chosenOpt = bestScoreOpt;
-                chosenScore = bestScore;
+                chosen = best.q;
+                chosenOpt = best.opt;
+                chosenScore = best.score;
             }
 
             if (chosen == null) return null;
@@ -787,22 +829,47 @@ public class ScreenshotGuardService extends Service {
         return s.length() > 200 ? s.substring(0, 200) : s;
     }
 
+    private double textSimilarity(String a, String b) {
+        String x = normalize(a);
+        String y = normalize(b);
+        if (x.isEmpty() || y.isEmpty()) return 0;
+        if (x.equals(y)) return 1;
+        if (x.contains(y) || y.contains(x)) return 0.95;
+        int head = Math.min(6, Math.min(x.length(), y.length()));
+        int headHit = 0;
+        for (int i = 0; i < head; i++) {
+            if (x.charAt(i) == y.charAt(i)) headHit++;
+        }
+        double headScore = head == 0 ? 0 : headHit * 1.0 / head;
+        int gramHits = 0;
+        int gramTotal = 0;
+        String sample = x.length() > 36 ? x.substring(0, 36) : x;
+        for (int i = 0; i + 1 < sample.length(); i++) {
+            gramTotal++;
+            String g = sample.substring(i, i + 2);
+            if (y.contains(g)) gramHits++;
+        }
+        double gramScore = gramTotal == 0 ? 0 : gramHits * 1.0 / gramTotal;
+        if (Math.min(x.length(), y.length()) <= 10) {
+            return Math.max(headScore, gramScore * 0.85);
+        }
+        return gramScore * 0.7 + headScore * 0.3;
+    }
+
     private double scoreOptionsAligned(JSONObject ocrOptions, JSONObject questionOptions) {
         if (ocrOptions == null || questionOptions == null || ocrOptions.length() == 0) return 0;
         try {
-            int hits = 0;
+            double sum = 0;
             int total = 0;
             Iterator<String> it = ocrOptions.keys();
             while (it.hasNext()) {
                 String k = it.next();
-                String a = normalize(ocrOptions.optString(k, ""));
+                String a = ocrOptions.optString(k, "");
                 if (a.isEmpty()) continue;
                 total++;
-                String b = normalize(questionOptions.optString(k, ""));
-                if (b.isEmpty()) continue;
-                if (a.equals(b) || a.contains(b) || b.contains(a)) hits++;
+                sum += textSimilarity(a, questionOptions.optString(k, ""));
             }
-            return total == 0 ? 0 : (hits * 1.0 / total);
+            return total == 0 ? 0 : sum / total;
         } catch (Throwable t) {
             return 0;
         }
@@ -815,25 +882,22 @@ public class ScreenshotGuardService extends Service {
             List<String> b = new ArrayList<>();
             Iterator<String> it = ocrOptions.keys();
             while (it.hasNext()) {
-                String n = normalize(ocrOptions.optString(it.next(), ""));
+                String n = ocrOptions.optString(it.next(), "").trim();
                 if (!n.isEmpty()) a.add(n);
             }
             Iterator<String> it2 = questionOptions.keys();
             while (it2.hasNext()) {
-                String n = normalize(questionOptions.optString(it2.next(), ""));
+                String n = questionOptions.optString(it2.next(), "").trim();
                 if (!n.isEmpty()) b.add(n);
             }
             if (a.isEmpty() || b.isEmpty()) return 0;
-            int hits = 0;
+            double sum = 0;
             for (String x : a) {
-                for (String y : b) {
-                    if (x.equals(y) || x.contains(y) || y.contains(x)) {
-                        hits++;
-                        break;
-                    }
-                }
+                double best = 0;
+                for (String y : b) best = Math.max(best, textSimilarity(x, y));
+                sum += best;
             }
-            return hits * 1.0 / Math.max(a.size(), b.size());
+            return sum / Math.max(a.size(), b.size());
         } catch (Throwable t) {
             return 0;
         }
@@ -841,7 +905,7 @@ public class ScreenshotGuardService extends Service {
 
     private double scoreOptions(JSONObject ocrOptions, JSONObject questionOptions) {
         return Math.max(scoreOptionsAligned(ocrOptions, questionOptions),
-            scoreOptionsBag(ocrOptions, questionOptions) * 0.95);
+            scoreOptionsBag(ocrOptions, questionOptions));
     }
 
     private double scoreTitle(String query, String title) {
@@ -862,10 +926,10 @@ public class ScreenshotGuardService extends Service {
 
     private double combineScore(double titleScore, double optScore, boolean hasOcrOpts) {
         if (!hasOcrOpts) return titleScore;
-        if (optScore >= 0.99) return 0.99;
-        if (optScore >= 0.75) return 0.55 * titleScore + 0.45 * optScore + 0.35;
-        if (optScore >= 0.5) return titleScore * 0.25 + optScore * 0.75;
-        return titleScore * 0.2 + optScore * 0.15;
+        if (optScore >= 0.9) return 0.99;
+        if (optScore >= 0.42) return 0.45 * titleScore + 0.55 * optScore + 0.25;
+        if (optScore >= 0.35) return titleScore * 0.35 + optScore * 0.65;
+        return titleScore * 0.55 + optScore * 0.25;
     }
 
     private double score(String query, String title, JSONObject ocrOptions, JSONObject questionOptions) {
@@ -875,6 +939,83 @@ public class ScreenshotGuardService extends Service {
 
     private String normalize(String text) {
         return text == null ? "" : text.replaceAll("[，。！？、；：\"\"''（）《》【】\\s?？,.!;:'\"()\\[\\]{}＿_…—－·]", "").toLowerCase(Locale.ROOT);
+    }
+
+    private String askDeepSeekFromOcr(String ocrText) throws Exception {
+        String prompt = "你是严谨的中国证券监管/并购重组考试答题助手。\n"
+            + "下面是截图 OCR 原文，可能混有界面杂质，例如：\n"
+            + "页码、微信、倒计时、大纲、上一页/下一页、收藏、删除、更多、AI匹配格式、复制、状态栏时间等。\n"
+            + "请自行识别真正题干与选项（或填空/简答），忽略无关污染文字，不要臆造不存在的条文。\n\n"
+            + "输出要求：\n"
+            + "- 单选题：只输出一个选项字母，如 C\n"
+            + "- 多选题：只输出全部正确选项字母（按字母序），如 AD\n"
+            + "- 填空/简答：只输出最终答案正文，尽量简短\n"
+            + "- 不要输出「答案是」等前缀，不要解释\n\n"
+            + "多选题判断提示：\n"
+            + "- 先排除明显违法/不合规干扰项，例如：仅需董事长个人决定、重组完成后再披露、无需审议、无需信息披露、不需要聘机构等\n"
+            + "- 优先选择符合监管常识的表述，例如：应当符合产业政策、现金购买不适用发股审核程序、真实准确完整披露、履行审议与披露义务等\n"
+            + "- 有几个选几个，不要勉强凑数\n\n"
+            + "OCR原文：\n" + ocrText;
+
+        JSONObject body = new JSONObject();
+        body.put("model", deepseekModel);
+        body.put("temperature", 0.1);
+        body.put("max_tokens", 256);
+        JSONArray messages = new JSONArray();
+        messages.put(new JSONObject().put("role", "system").put("content", "你只输出考试答案本身，不输出分析。"));
+        messages.put(new JSONObject().put("role", "user").put("content", prompt));
+        body.put("messages", messages);
+
+        String base = deepseekBase.endsWith("/") ? deepseekBase.substring(0, deepseekBase.length() - 1) : deepseekBase;
+        HttpURLConnection conn = (HttpURLConnection) new URL(base + "/chat/completions").openConnection();
+        conn.setConnectTimeout(20000);
+        conn.setReadTimeout(45000);
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer " + deepseekKey);
+        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+        conn.setFixedLengthStreamingMode(bytes.length);
+        OutputStream os = conn.getOutputStream();
+        os.write(bytes);
+        os.close();
+
+        int code = conn.getResponseCode();
+        InputStream in = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
+        String resp = readStream(in);
+        conn.disconnect();
+        if (code < 200 || code >= 300) {
+            throw new Exception("DeepSeek HTTP " + code + ": " + trim(resp, 200));
+        }
+        JSONObject json = new JSONObject(resp);
+        JSONArray choices = json.optJSONArray("choices");
+        if (choices == null || choices.length() == 0) return "";
+        String content = choices.getJSONObject(0).optJSONObject("message").optString("content", "").trim();
+        return parseAnswerFromOcr(content);
+    }
+
+    private String parseAnswerFromOcr(String content) {
+        String text = content == null ? "" : content.trim();
+        text = text.replaceFirst("(?i)^答案[:：\\s]*", "").trim();
+        String compact = text.replaceAll("\\s+", "");
+        if (compact.matches("(?i)^[A-Fa-f]{2,6}$")) {
+            return compact.toUpperCase(Locale.ROOT);
+        }
+        if (text.matches("(?i)^[A-Fa-f]{2,6}$")) return text.toUpperCase(Locale.ROOT);
+        if (text.length() <= 12) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b([A-Fa-f]{1,6})\\b").matcher(text);
+            if (m.find()) {
+                String g = m.group(1).toUpperCase(Locale.ROOT);
+                char[] arr = g.toCharArray();
+                java.util.Arrays.sort(arr);
+                StringBuilder sb = new StringBuilder();
+                for (char c : arr) {
+                    if (sb.indexOf(String.valueOf(c)) < 0) sb.append(c);
+                }
+                return sb.toString();
+            }
+        }
+        return text.length() > 120 ? text.substring(0, 120) : text;
     }
 
     private String askDeepSeek(JSONObject question) throws Exception {
